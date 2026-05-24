@@ -4,9 +4,10 @@ import {FC, ReactNode, createContext, useContext, useEffect} from "react"
 import {AppState, Platform} from "react-native"
 
 import {NavObject, useNavigationHistory, getCurrentRoute} from "@/contexts/NavigationHistoryContext"
+import {useSplashLoader} from "@/contexts/SplashLoaderProvider"
 import {useAppletStatusStore} from "@/stores/applets"
 import mentraAuth from "@/utils/auth/authClient"
-import {BackgroundTimer} from "@/utils/timers"
+import {BgTimer} from "@/utils/timers"
 
 /** Returns immediately if the app is already active, otherwise waits for it. */
 const waitForActive = (): Promise<void> => {
@@ -261,7 +262,7 @@ const deepLinkRoutes: DeepLinkRoute[] = [
         // Use replace() instead of replaceAll() to avoid POP_TO_TOP errors
         // when the navigation stack is empty (coming back from browser)
         console.log("[LOGIN DEBUG] About to set timeout for navigation")
-        BackgroundTimer.setTimeout(() => {
+        BgTimer.setTimeout(() => {
           console.log("[LOGIN DEBUG] Inside setTimeout, navigating to index")
           try {
             navObject.setAnimation("none")
@@ -427,6 +428,7 @@ export const DeeplinkProvider: FC<{children: ReactNode}> = ({children}) => {
     getCurrentRoute,
     getCurrentParams,
   } = useNavigationHistory()
+  const {setSplashEnabled} = useSplashLoader()
   const config = {
     scheme: "com.mentra",
     host: "apps.mentra.glass",
@@ -618,7 +620,13 @@ export const DeeplinkProvider: FC<{children: ReactNode}> = ({children}) => {
           getCurrentRoute,
           getCurrentParams,
         }
-        await matchedRoute.handler(url, params, navObject)
+        setSplashEnabled(true)
+        BgTimer.setTimeout(async () => {
+          await matchedRoute.handler(url, params, navObject)
+          setTimeout(() => {
+            setSplashEnabled(false)
+          }, 2500)
+        }, 100)
       } catch (error) {
         console.warn("Route handler failed, router may not be ready:", error)
       }

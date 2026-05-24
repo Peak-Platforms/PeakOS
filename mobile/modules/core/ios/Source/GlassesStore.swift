@@ -45,6 +45,7 @@ class GlassesStore {
         store.set("glasses", "hotspotPassword", "")
         store.set("glasses", "hotspotGatewayIp", "")
         store.set("glasses", "bluetoothName", "")
+        store.set("glasses", "macAddress", "")
         store.set("glasses", "controllerConnected", false)
         store.set("glasses", "controllerMacAddress", "")
         store.set("glasses", "controllerBatteryLevel", -1)
@@ -222,7 +223,7 @@ class GlassesStore {
                 CoreManager.shared.sgc?.setHeadUpAngle(angle)
             }
 
-        case ("core", "dashboard_menu_apps"):
+        case ("core", "menu_apps"):
             if let items = value as? [[String: Any]] {
                 CoreManager.shared.sgc?.setDashboardMenu(items)
             }

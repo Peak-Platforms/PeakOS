@@ -345,6 +345,8 @@ export interface GlassesStatus {
   besFwVersion: string
   mtkFwVersion: string
   btMacAddress: string
+  leftMacAddress: string
+  rightMacAddress: string
   buildNumber: string
   otaVersionUrl: string
   appVersion: string
@@ -378,6 +380,16 @@ export interface GlassesStatus {
   controllerMacAddress: string
   controllerBatteryLevel: number
   controllerSignalStrength: number
+}
+
+interface DashboardMenuItem {
+  name: string
+  packageName: string
+  running: boolean
+}
+
+export interface CoreSettings {
+  menu_apps: DashboardMenuItem[]
 }
 
 export type MicRanking = "auto" | "phone" | "glasses" | "bluetooth"

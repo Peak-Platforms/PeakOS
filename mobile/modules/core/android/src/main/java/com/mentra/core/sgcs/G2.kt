@@ -858,7 +858,7 @@ private class G2SendManager {
 private class G2ReceiveManager {
     private val partials = mutableMapOf<String, Pair<ByteArrayOutputStream, Byte>>()
 
-    fun handlePacket(rawData: ByteArray): Pair<Byte, ByteArray>? {
+    fun handlePacket(rawData: ByteArray, sourceKey: String = ""): Pair<Byte, ByteArray>? {
         if (rawData.size < 8) return null
         if (rawData[0] != G2BLE.HEADER_BYTE) return null
 
@@ -880,7 +880,9 @@ private class G2ReceiveManager {
         val payload = rawData.copyOfRange(8, payloadEnd)
 
         val syncId = rawData[2]
-        val key = "${serviceId.toInt() and 0xFF}-${syncId.toInt() and 0xFF}"
+        // Include sourceKey so concurrent multi-packet responses from the L and R lenses with
+        // the same syncId don't cross-merge into one broken payload.
+        val key = "$sourceKey-${serviceId.toInt() and 0xFF}-${syncId.toInt() and 0xFF}"
 
         if ((serialNum.toInt() and 0xFF) > 1) {
             val existing = partials[key] ?: return null
@@ -971,17 +973,6 @@ class G2 : SGCManager() {
         hasMic = true
     }
 
-    // Connection state
-    private var _ready: Boolean = false
-    private var ready: Boolean
-        get() = _ready
-        set(value) {
-            _ready = value
-            if (!value) {
-                _batteryLevel = -1
-            }
-        }
-
     // BLE
     private val context: Context
         get() = Bridge.getContext()
@@ -997,6 +988,7 @@ class G2 : SGCManager() {
     private var leftInitialized: Boolean = false
     private var rightInitialized: Boolean = false
     private var isDisconnecting = false
+    private var pairingTimeoutRunnable: Runnable? = null
 
     // Device search
     private var DEVICE_SEARCH_ID = "NOT_SET"
@@ -1041,6 +1033,12 @@ class G2 : SGCManager() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var heartbeatRunnable: Runnable? = null
     private var devSettingsHeartbeatRunnable: Runnable? = null
+    private var evenHubQueueRunnable: Runnable? = null
+    private var pendingTextMsg: ByteArray? = null
+    private var lastEvenHubMsg: ByteArray? = null
+    private var lastEvenHubResendsRemaining: Int = 0
+    private val EVEN_HUB_RESEND_COUNT: Int = 1
+    private val EVEN_HUB_QUEUE_TICK_MS = 100L
     private var micEnabled_: Boolean = false
     private var startupPageCreated: Boolean = false
     private var pageCreated: Boolean = false
@@ -1050,6 +1048,8 @@ class G2 : SGCManager() {
     private var imageSessionCounter: Int = 0
     private var heartbeatCounter: Int = 0
     private var authStarted: Boolean = false
+    private var leftAuthenticated: Boolean = false
+    private var rightAuthenticated: Boolean = false
     private var currentBitmapBase64: String = ""
 
     // Dashboard menu state
@@ -1544,7 +1544,6 @@ class G2 : SGCManager() {
                                             // Mark as ready and request device info
                                             mainHandler.postDelayed(
                                                     {
-                                                        ready = true
                                                         reconnectionManager.stop()
                                                         Bridge.log(
                                                                 "G2: Auth sequence complete, glasses ready"
@@ -1555,20 +1554,19 @@ class G2 : SGCManager() {
                                                         val peripheralName =
                                                                 rightGatt?.device?.name
                                                                         ?: leftGatt?.device?.name
-                                                        if (peripheralName != null) {
-                                                            val idNumber =
-                                                                    extractIdNumber(peripheralName)
-                                                            if (idNumber != null) {
-                                                                val deviceId = "$idNumber"
-                                                                GlassesStore.apply(
-                                                                        "core",
-                                                                        "device_name",
-                                                                        deviceId
-                                                                )
-                                                                Bridge.log(
-                                                                        "G2: Set device_name to $deviceId"
-                                                                )
-                                                            }
+                                                        val serialNumber =
+                                                                peripheralName?.let {
+                                                                    deviceNameToSerialNumber[it]
+                                                                }
+                                                        if (serialNumber != null) {
+                                                            GlassesStore.apply(
+                                                                    "core",
+                                                                    "device_name",
+                                                                    serialNumber
+                                                            )
+                                                            Bridge.log(
+                                                                    "G2: Set device_name to $serialNumber"
+                                                            )
                                                         }
 
                                                         // Set bluetooth name and device model for
@@ -1605,22 +1603,7 @@ class G2 : SGCManager() {
                                                         // Query version + battery info from glasses
                                                         requestDeviceInfo()
 
-                                                        // Re-send dashboard menu if we have stored
-                                                        // items
-                                                        if (dashboardMenuItems.isNotEmpty()) {
-                                                            val (msg, appIdMap) =
-                                                                    MenuProto.sendMenuInfo(
-                                                                            sendManager
-                                                                                    .nextMagicRandom(),
-                                                                            dashboardMenuItems
-                                                                    )
-                                                            menuAppIdToPackageName =
-                                                                    appIdMap.toMutableMap()
-                                                            sendMenuCommand(msg)
-                                                            Bridge.log(
-                                                                    "G2: Re-sent dashboard menu (${dashboardMenuItems.size} items)"
-                                                            )
-                                                        }
+                                                        sendMenuApps()
                                                     },
                                                     500
                                             )
@@ -1703,6 +1686,17 @@ class G2 : SGCManager() {
                 }
         devSettingsHeartbeatRunnable = dsRunnable
         mainHandler.postDelayed(dsRunnable, 5000)
+
+        // EvenHub text command queue: drain the most recent pending updateText every 100ms
+        val queueRunnable =
+                object : Runnable {
+                    override fun run() {
+                        drainEvenHubQueue()
+                        mainHandler.postDelayed(this, EVEN_HUB_QUEUE_TICK_MS)
+                    }
+                }
+        evenHubQueueRunnable = queueRunnable
+        mainHandler.postDelayed(queueRunnable, EVEN_HUB_QUEUE_TICK_MS)
     }
 
     private fun stopHeartbeats() {
@@ -1710,10 +1704,18 @@ class G2 : SGCManager() {
         heartbeatRunnable = null
         devSettingsHeartbeatRunnable?.let { mainHandler.removeCallbacks(it) }
         devSettingsHeartbeatRunnable = null
+        evenHubQueueRunnable?.let { mainHandler.removeCallbacks(it) }
+        evenHubQueueRunnable = null
+        pendingTextMsg = null
+        lastEvenHubMsg = null
+        lastEvenHubResendsRemaining = 0
     }
 
     private fun sendEvenHubHeartbeat() {
-        if (!ready) return
+        val isFullyBooted = GlassesStore.get("glasses", "fullyBooted") as? Boolean ?: false
+        if (!isFullyBooted) {
+            return
+        }
         val msg = EvenHubProto.heartbeatMessage()
         sendEvenHubCommand(msg)
 
@@ -1725,7 +1727,10 @@ class G2 : SGCManager() {
     }
 
     private fun sendDevSettingsHeartbeat() {
-        if (!ready) return
+        val isFullyBooted = GlassesStore.get("glasses", "fullyBooted") as? Boolean ?: false
+        if (!isFullyBooted) {
+            return
+        }
         val msg = DevSettingsProto.baseHeartbeat(sendManager.nextMagicRandom())
         sendDevSettingsCommand(msg)
     }
@@ -1736,10 +1741,18 @@ class G2 : SGCManager() {
         Bridge.log("G2: Requested device info (battery/version)")
     }
 
+    private fun sendMenuApps() {
+        val menuItems =
+                GlassesStore.get("core", "menu_apps") as? List<Map<String, Any>> ?: emptyList()
+        if (menuItems.isNotEmpty()) {
+            setDashboardMenu(menuItems)
+        }
+    }
+
     // ---------- SGCManager: Display Control ----------
 
     override fun sendTextWall(text: String) {
-        Bridge.log("G2: sendTextWall(${text.take(50)}...)")
+        // Bridge.log("G2: sendTextWall(${text.take(10)}...)")
 
         if (text.isEmpty()) {
             clearDisplay()
@@ -1909,6 +1922,7 @@ class G2 : SGCManager() {
     }
 
     override fun setDashboardMenu(items: List<Map<String, Any>>) {
+        Bridge.log("G2: setDashboardMenu -- items: $items")
         val menuItems =
                 items.mapNotNull { dict ->
                     val name = dict["name"] as? String ?: return@mapNotNull null
@@ -1989,9 +2003,31 @@ class G2 : SGCManager() {
                         contentLength = text.toByteArray(Charsets.UTF_8).size,
                         content = text
                 )
-        sendEvenHubCommand(msg)
+        queueEvenHubCommand(msg)
         currentTextContent = text
         currentBitmapBase64 = ""
+    }
+
+    @Synchronized
+    private fun queueEvenHubCommand(payload: ByteArray) {
+        pendingTextMsg = payload
+    }
+
+    @Synchronized
+    private fun drainEvenHubQueue() {
+        val msg = pendingTextMsg
+        pendingTextMsg = null
+        val toSend: ByteArray? = if (msg != null) {
+            lastEvenHubMsg = msg
+            lastEvenHubResendsRemaining = EVEN_HUB_RESEND_COUNT
+            msg
+        } else if (lastEvenHubResendsRemaining > 0 && lastEvenHubMsg != null) {
+            lastEvenHubResendsRemaining -= 1
+            lastEvenHubMsg
+        } else {
+            null
+        }
+        toSend?.let { sendEvenHubCommand(it) }
     }
 
     // ---------- Bitmap Conversion ----------
@@ -2141,9 +2177,20 @@ class G2 : SGCManager() {
 
     override fun setMicEnabled(enabled: Boolean) {
         Bridge.log("G2: setMicEnabled($enabled)")
-        micEnabled_ = enabled
+        val currentEnabled = GlassesStore.get("glasses", "micEnabled") as? Boolean ?: false
+        
+        // if already enabled, set to disabled, then send enabled after 500ms:
+        if (currentEnabled && enabled) {
+            GlassesStore.apply("glasses", "micEnabled", true)
+            val msg = EvenHubProto.audioControlMessage(false)
+            sendEvenHubCommand(msg)
+            mainHandler.postDelayed({
+                val msg = EvenHubProto.audioControlMessage(true)
+                sendEvenHubCommand(msg)
+            }, 500)
+            return
+        }
         GlassesStore.apply("glasses", "micEnabled", enabled)
-
         val msg = EvenHubProto.audioControlMessage(enabled)
         sendEvenHubCommand(msg)
     }
@@ -2176,18 +2223,6 @@ class G2 : SGCManager() {
 
     override fun sendStreamKeepAlive(message: MutableMap<String, Any>) {
         Bridge.log("G2: sendStreamKeepAlive - not supported")
-    }
-
-    override fun startBufferRecording() {
-        Bridge.log("G2: startBufferRecording - not supported")
-    }
-
-    override fun stopBufferRecording() {
-        Bridge.log("G2: stopBufferRecording - not supported")
-    }
-
-    override fun saveBufferVideo(requestId: String, durationSeconds: Int) {
-        Bridge.log("G2: saveBufferVideo - not supported")
     }
 
     override fun startVideoRecording(
@@ -2238,11 +2273,30 @@ class G2 : SGCManager() {
         Bridge.log("G2: connectById($id)")
         DEVICE_SEARCH_ID = id
         startScan()
+        startPairingTimeout()
+    }
+
+    private fun startPairingTimeout() {
+        pairingTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        val work = Runnable {
+            if (leftGatt != null && rightGatt == null) {
+                Bridge.log("G2: pairing timeout — found LEFT but not RIGHT")
+                Bridge.sendPairFailureEvent("errors:pairNeedDisconnect")
+            }
+        }
+        pairingTimeoutRunnable = work
+        mainHandler.postDelayed(work, 10_000)
+    }
+
+    private fun cancelPairingTimeout() {
+        pairingTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        pairingTimeoutRunnable = null
     }
 
     override fun disconnect() {
         Bridge.log("G2: disconnect()")
         isDisconnecting = true
+        cancelPairingTimeout()
         stopScan()
         stopHeartbeats()
         reconnectionManager.stop()
@@ -2252,10 +2306,11 @@ class G2 : SGCManager() {
         rightGatt?.disconnect()
         rightGatt?.close()
 
-        ready = false
         leftInitialized = false
         rightInitialized = false
         authStarted = false
+        leftAuthenticated = false
+        rightAuthenticated = false
         startupPageCreated = false
         pageCreated = false
         pageHasTextContainer = false
@@ -2303,11 +2358,23 @@ class G2 : SGCManager() {
     override fun dbg1() {
         connectController()
     }
-    override fun dbg2() {}
+    override fun dbg2() {
+        disconnectController()
+    }
+
+    fun reconnectController() {
+        val mac = GlassesStore.get("glasses", "controllerMacAddress") as? String
+        if (mac.isNullOrEmpty()) {
+            Bridge.log("G2: reconnectController - no MAC address found")
+            return
+        }
+        connectController()
+    }
 
     override fun connectController() {
-        if (!ready) {
-            Bridge.log("G2: connectController - not ready, ignoring")
+        val isFullyBooted = GlassesStore.get("glasses", "fullyBooted") as? Boolean ?: false
+        if (!isFullyBooted) {
+            Bridge.log("G2: connectController - g2 not fully booted, ignoring")
             return
         }
         val mac = GlassesStore.get("glasses", "controllerMacAddress") as? String
@@ -2320,7 +2387,7 @@ class G2 : SGCManager() {
             Bridge.log("G2: connectController - invalid MAC format: $mac")
             return
         }
-        Bridge.log("G2: about to connectController - MAC: $mac")
+        Bridge.log("G2: connectController() - MAC: $mac")
         val macData = hexParts.toByteArray()
         val msg = DevSettingsProto.ringConnectInfo(sendManager.nextMagicRandom(), true, macData)
         sendDevSettingsCommand(msg)
@@ -2328,8 +2395,9 @@ class G2 : SGCManager() {
     }
 
     override fun disconnectController() {
-        if (!ready) {
-            Bridge.log("G2: disconnectController - not ready, ignoring")
+        val isFullyBooted = GlassesStore.get("glasses", "fullyBooted") as? Boolean ?: false
+        if (!isFullyBooted) {
+            Bridge.log("G2: disconnectController - g2 not fully booted, ignoring")
             return
         }
         val mac = GlassesStore.get("glasses", "controllerMacAddress") as? String
@@ -2345,7 +2413,7 @@ class G2 : SGCManager() {
         val macData = hexParts.toByteArray()
         val msg = DevSettingsProto.ringConnectInfo(sendManager.nextMagicRandom(), false, macData)
         sendDevSettingsCommand(msg)
-        GlassesStore.apply("glasses", "controllerMacAddress", "")
+        // GlassesStore.apply("glasses", "controllerMacAddress", "")
         GlassesStore.apply("glasses", "controllerConnected", false)
         GlassesStore.apply("glasses", "controllerFullyBooted", false)
         Bridge.log("G2: Sent RING_DISCONNECT_INFO for MAC $mac")
@@ -2481,8 +2549,25 @@ class G2 : SGCManager() {
                                 return@post
                             }
 
-                            Bridge.log("G2: Discovered: $name (SN: $serialNumber)")
+                            val mfgFirst = result.scanRecord?.manufacturerSpecificData?.valueAt(0)
+                            val mfgHex =
+                                    mfgFirst?.joinToString(" ") { String.format("%02X", it) }
+                                            ?: "none"
+                            Bridge.log(
+                                    "G2: Discovered: $name (SN: $serialNumber) mfgData[${mfgFirst?.size ?: 0}]: $mfgHex"
+                            )
                             deviceNameToSerialNumber[name] = serialNumber
+
+                            // Save MAC per side; ring's advStart needs the left lens MAC.
+                            val mac = extractMacFromScanRecord(result)
+                            if (mac != null) {
+                                if (name.contains("_L_")) {
+                                    GlassesStore.apply("glasses", "leftMacAddress", mac)
+                                    GlassesStore.apply("glasses", "btMacAddress", mac)
+                                } else if (name.contains("_R_")) {
+                                    GlassesStore.apply("glasses", "rightMacAddress", mac)
+                                }
+                            }
                             // Stop scanning once we have both
                             if (leftGatt != null && rightGatt != null) {
                                 stopScan()
@@ -2515,6 +2600,7 @@ class G2 : SGCManager() {
                             // Stop scanning once we have both
                             if (leftGatt != null && rightGatt != null) {
                                 stopScan()
+                                cancelPairingTimeout()
                                 Bridge.log("G2: Stopped scan after discovering both devices2")
                             }
                         }
@@ -2526,7 +2612,18 @@ class G2 : SGCManager() {
                 }
 
         scanCallback = callback
-        scanner.startScan(null, settings, callback)
+        try {
+            scanner.startScan(null, settings, callback)
+        } catch (e: SecurityException) {
+            // Auto-reconnect paths may fire before BLUETOOTH_SCAN is granted on Android 12+
+            Bridge.log("G2: startScan SecurityException — bluetooth permission missing: ${e.message}")
+            scanCallback = null
+            return false
+        } catch (e: Exception) {
+            Bridge.log("G2: startScan failed: ${e.message}")
+            scanCallback = null
+            return false
+        }
         return true
     }
 
@@ -2588,6 +2685,21 @@ class G2 : SGCManager() {
         return if (sn.isNotEmpty()) sn else null
     }
 
+    /**
+     * Extract the BLE MAC from the G2 scan record manufacturer data. Layout (after Android strips
+     * the 2-byte company ID): SN(14) + MAC(6, little-endian) + flag(1) Returns "AA:BB:CC:DD:EE:FF"
+     * (big-endian, colon-separated).
+     */
+    private fun extractMacFromScanRecord(result: ScanResult): String? {
+        val scanRecord = result.scanRecord ?: return null
+        val mfgData = scanRecord.manufacturerSpecificData
+        if (mfgData == null || mfgData.size() == 0) return null
+        val data = mfgData.valueAt(0) ?: return null
+        if (data.size < 20) return null
+        val macLE = data.copyOfRange(14, 20)
+        return macLE.reversed().joinToString(":") { String.format("%02X", it.toInt() and 0xFF) }
+    }
+
     private fun emitDiscoveredDevice(serialNumber: String) {
         Bridge.sendDiscoveredDevice(DeviceTypes.G2, serialNumber)
     }
@@ -2622,7 +2734,37 @@ class G2 : SGCManager() {
                             rightGlassAddress = address
                         }
 
-                        gatt.discoverServices()
+                        // Request a larger MTU so 200-byte audio notifications aren't fragmented.
+                        // Default ATT MTU is 23 → max payload 20 bytes, which would chop each audio
+                        // chunk into 10+ pieces. We ask for 247 (max for BLE 4.2+ data length ext).
+                        // discoverServices is deferred to onMtuChanged so the larger MTU is in
+                        // effect for the rest of the setup.
+                        val mtuRequested =
+                                try {
+                                    gatt.requestMtu(247)
+                                } catch (e: SecurityException) {
+                                    Bridge.log(
+                                            "G2: requestMtu SecurityException on $side: ${e.message}"
+                                    )
+                                    false
+                                }
+                        if (!mtuRequested) {
+                            Bridge.log(
+                                    "G2: requestMtu returned false on $side, proceeding without MTU bump"
+                            )
+                            gatt.discoverServices()
+                        }
+
+                        // Ask for high connection priority so the link can sustain 16 kHz / 10 ms
+                        // audio without dropped notifications. Caller is responsible for dropping
+                        // back to BALANCED later if power becomes a concern.
+                        try {
+                            gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+                        } catch (e: SecurityException) {
+                            Bridge.log(
+                                    "G2: requestConnectionPriority SecurityException on $side: ${e.message}"
+                            )
+                        }
                     } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                         Bridge.log("G2: Disconnected $side")
 
@@ -2642,8 +2784,9 @@ class G2 : SGCManager() {
                         leftAudioChar = null
                         rightAudioChar = null
                         authStarted = false
+                        leftAuthenticated = false
+                        rightAuthenticated = false
 
-                        ready = false
                         startupPageCreated = false
                         pageCreated = false
                         pageHasTextContainer = false
@@ -2651,6 +2794,19 @@ class G2 : SGCManager() {
                         GlassesStore.apply("glasses", "fullyBooted", false)
 
                         startReconnectionTimer()
+                    }
+                }
+            }
+
+            override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+                Bridge.log("G2: onMtuChanged $side mtu=$mtu status=$status")
+                mainHandler.post {
+                    // discoverServices was deferred until MTU negotiation finishes (success or
+                    // not).
+                    try {
+                        gatt.discoverServices()
+                    } catch (e: SecurityException) {
+                        Bridge.log("G2: discoverServices SecurityException on $side: ${e.message}")
                     }
                 }
             }
@@ -2731,11 +2887,10 @@ class G2 : SGCManager() {
             ) {
                 val data = characteristic.value ?: return
 
-                mainHandler.post {
-                    when (characteristic.uuid) {
-                        G2BLE.AUDIO_NOTIFY -> handleAudioData(data)
-                        G2BLE.CHAR_NOTIFY -> handleNotifyData(data)
-                    }
+                val sourceKey = if (side == "LEFT") "L" else "R"
+                when (characteristic.uuid) {
+                    G2BLE.AUDIO_NOTIFY -> handleAudioData(data, sourceKey)
+                    G2BLE.CHAR_NOTIFY -> mainHandler.post { handleNotifyData(data, sourceKey) }
                 }
             }
 
@@ -2787,15 +2942,15 @@ class G2 : SGCManager() {
 
     // ---------- Incoming Data Handling ----------
 
-    private fun handleNotifyData(data: ByteArray) {
-        val result = receiveManager.handlePacket(data) ?: return
+    private fun handleNotifyData(data: ByteArray, sourceKey: String) {
+        val result = receiveManager.handlePacket(data, sourceKey) ?: return
 
         val serviceId = result.first
         val payload = result.second
 
         when (serviceId) {
             ServiceID.EVEN_HUB.value -> handleEvenHubResponse(payload)
-            ServiceID.DEVICE_SETTINGS.value -> handleDevSettingsResponse(payload)
+            ServiceID.DEVICE_SETTINGS.value -> handleDevSettingsResponse(payload, sourceKey)
             ServiceID.G2_SETTING.value -> handleG2SettingResponse(payload)
             ServiceID.MENU.value -> handleMenuResponse(payload)
             ServiceID.DASHBOARD.value -> handleDashboardResponse(payload)
@@ -2831,7 +2986,7 @@ class G2 : SGCManager() {
             val devEventData = fields[13] as? ByteArray ?: return
             val timestamp = System.currentTimeMillis()
             val last = lastClickTimestamp
-            if (last != null && timestamp - last < 100) {
+            if (last != null && timestamp - last < 250) {
                 return
             }
             lastClickTimestamp = timestamp
@@ -2862,13 +3017,15 @@ class G2 : SGCManager() {
             }
         } else {
             // Parse error codes from responses
-            // field 4 = StartupResCmd, field 6 = ImgResCmd, field 8 = RebuildResCmd, field 10 = TextResCmd
+            // field 4 = StartupResCmd, field 6 = ImgResCmd, field 8 = RebuildResCmd, field 10 =
+            // TextResCmd
             for (resField in listOf(4, 6, 8, 10)) {
                 val resData = fields[resField] as? ByteArray ?: continue
                 val resReader = ProtobufReader(resData)
                 val resFields = resReader.parseFields()
                 (resFields[1] as? Int)?.let { errorCode ->
-                    // 0=page_success, 4=img_success, 5=img_failed, 6=rebuild_success, 7=rebuild_failed, 8=text_success, 9=text_failed
+                    // 0=page_success, 4=img_success, 5=img_failed, 6=rebuild_success,
+                    // 7=rebuild_failed, 8=text_success, 9=text_failed
                     if (errorCode == 9) {
                         Bridge.log(
                                 "G2: WARN: Glasses shutdown our EvenHub page — resetting page state"
@@ -2954,7 +3111,7 @@ class G2 : SGCManager() {
             Bridge.sendTouchEvent(DeviceTypes.G2, gestureName, timestamp, eventSource)
             Bridge.log("G2: SysEvent → $eventType $eventSource")
 
-            if (eventSource == 1) {
+            if (eventSource == 2) {
                 // controller must be connected and fully booted:
                 setControllerFullyConnected()
             }
@@ -2964,10 +3121,10 @@ class G2 : SGCManager() {
                 val isHeadUp = GlassesStore.get("glasses", "headUp") as? Boolean ?: false
                 // toggle head up:
                 GlassesStore.apply("glasses", "headUp", !isHeadUp)
-                if (isHeadUp) {
-                    // clear the display after a delay:
-                    mainHandler.postDelayed({ clearDisplay() }, 500)
-                }
+                // if (isHeadUp) {
+                //     // clear the display after a delay:
+                //     mainHandler.postDelayed({ clearDisplay() }, 500)
+                // }
             }
 
             // System exit: glasses killed our EvenHub page (user opened menu or another app)
@@ -2978,6 +3135,9 @@ class G2 : SGCManager() {
                 pageHasTextContainer = false
                 currentTextContent = ""
                 currentBitmapBase64 = ""
+                // Firmware kills the mic on system exit; re-arm it if it should be on
+                GlassesStore.apply("glasses", "micEnabled", false)
+                CoreManager.getInstance().updateMicState()
             }
             return
         }
@@ -2989,6 +3149,11 @@ class G2 : SGCManager() {
             val eventTypeRaw = textFields[3] as? Int ?: return@let
             val eventType = OsEventType.fromInt(eventTypeRaw) ?: return@let
             val gestureName = mapEventTypeToGesture(eventType)
+            // log raw event data:
+            // Bridge.log("G2: TextEvent raw data: ${textData.joinToString("") {
+            // String.format("%02X", it) }}")
+            // Bridge.log("G2: TextEvent fields: $textFields")
+
             if (gestureName == null) {
                 Bridge.log("G2: no gesture mapping for $eventType $textFields")
                 return@let
@@ -3014,7 +3179,7 @@ class G2 : SGCManager() {
         }
     }
 
-    private fun handleDevSettingsResponse(payload: ByteArray) {
+    private fun handleDevSettingsResponse(payload: ByteArray, sourceKey: String) {
         val reader = ProtobufReader(payload)
         val fields = reader.parseFields()
         val cmdValue = fields[1] as? Int ?: -1
@@ -3025,6 +3190,29 @@ class G2 : SGCManager() {
         Bridge.log(
                 "G2: DevSettings response: ${payload.take(32).joinToString(":") { String.format("%02X", it) }}"
         )
+
+        if (cmdValue == DevCfgCommandId.AUTHENTICATION.value) {
+            // DevCfgDataPackage: field 2 = magicRandom, field 3 = AuthMgr { field 1 = secAuth }
+            var secAuth: Boolean? = null
+            (fields[3] as? ByteArray)?.let { authData ->
+                val authReader = ProtobufReader(authData)
+                val authFields = authReader.parseFields()
+                (authFields[1] as? Int)?.let { secAuth = (it != 0) }
+            }
+            val secAuthStr = secAuth?.toString() ?: "?"
+            Bridge.log("G2: Authentication response: $sourceKey secAuth=$secAuthStr")
+            if (secAuth == true) {
+                if (sourceKey == "L") {
+                    leftAuthenticated = true
+                } else if (sourceKey == "R") {
+                    rightAuthenticated = true
+                }
+                if (leftAuthenticated && rightAuthenticated) {
+                    Bridge.log("G2: Both sides authenticated, setting fully booted and connected")
+                    setFullyConnected()
+                }
+            }
+        }
 
         // RING_CONNECT_INFO response (cmd 6)
         if (cmdValue == DevCfgCommandId.RING_CONNECT_INFO.value) {
@@ -3045,11 +3233,18 @@ class G2 : SGCManager() {
                 val connStatus = ringFields[4] as? Int ?: -1
                 Bridge.log("G2: Ring connection status: connStatus?=$connStatus")
 
-                if (connStatus == 22 || connStatus == 8) {
+                if (connStatus == 22) {
                     Bridge.log("G2: Ring disconnected")
                     GlassesStore.apply("glasses", "controllerFullyBooted", false)
                     GlassesStore.apply("glasses", "controllerSearching", true)
-                    connectController() // attempt reconnect
+                    reconnectController()
+                }
+
+                if (connStatus == 8) {
+                    Bridge.log("G2: Ring maybe disconnected?")
+                    // GlassesStore.apply("glasses", "controllerFullyBooted", false)
+                    // GlassesStore.apply("glasses", "controllerSearching", true)
+                    // reconnectController()
                 }
             }
         }
@@ -3129,6 +3324,8 @@ class G2 : SGCManager() {
         val reader = ProtobufReader(data)
         val fields = reader.parseFields()
 
+        setFullyConnected()
+
         // Battery
         (fields[12] as? Int)?.let { battery ->
             if (battery in 0..100) {
@@ -3169,11 +3366,22 @@ class G2 : SGCManager() {
 
     // ---------- Audio Handling ----------
 
-    private fun handleAudioData(data: ByteArray) {
+    private var lastAudioFrame: ByteArray? = null
+
+    private fun handleAudioData(data: ByteArray, sourceKey: String) {
+        // Diagnostic: if BLE notifications are arriving fragmented (MTU too small), data.size
+        // will be consistently < 200. Expected: ~200-byte chunks (5 × 40-byte LC3 frames).
+
         val usableLength = minOf(data.size, 200)
         if (usableLength < 40) return
 
         val audioData = data.copyOfRange(0, usableLength)
+        if (lastAudioFrame?.contentEquals(audioData) == true) {
+            // Bridge.log("G2: audio dup from $sourceKey: ${data.take(10).joinToString("") { String.format("%02X", it) }}")
+            return
+        }
+        lastAudioFrame = audioData
+        Bridge.log("G2: audio data from $sourceKey: ${data.take(10).joinToString("") { String.format("%02X", it) }}")
         CoreManager.getInstance().handleGlassesMicData(audioData, 40)
     }
 
@@ -3181,7 +3389,8 @@ class G2 : SGCManager() {
 
     private fun startReconnectionTimer() {
         reconnectionManager.start {
-            if (ready) {
+            val isFullyBooted = GlassesStore.get("glasses", "fullyBooted") as? Boolean ?: false
+            if (isFullyBooted) {
                 Bridge.log("G2: Already connected, stopping reconnection")
                 return@start true
             }

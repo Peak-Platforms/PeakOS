@@ -15,7 +15,7 @@ import restComms from "@/services/RestComms"
 import socketComms from "@/services/SocketComms"
 import {SETTINGS, useSetting, useSettingsStore} from "@/stores/settings"
 import {SplashVideo} from "@/components/splash/SplashVideo"
-import {BackgroundTimer} from "@/utils/timers"
+import {BgTimer} from "@/utils/timers"
 
 // Types
 type ScreenState = "loading" | "connection" | "auth" | "outdated" | "success"
@@ -80,7 +80,7 @@ export default function InitScreen() {
   }
 
   const setAnimationDelayed = () => {
-    BackgroundTimer.setTimeout(() => {
+    BgTimer.setTimeout(() => {
       setAnimation("simple_push")
     }, 800)
   }
@@ -122,16 +122,7 @@ export default function InitScreen() {
     await new Promise((resolve) => setTimeout(resolve, NAVIGATION_DELAY))
     setAnimationDelayed()
     clearHistoryAndGoHome({transition: "fade"})
-  }, [
-    user,
-    getPendingRoute,
-    processUrl,
-    clearHistoryAndGoHome,
-    replace,
-    replaceAll,
-    setPendingRoute,
-    setAnimation,
-  ])
+  }, [user, getPendingRoute, processUrl, clearHistoryAndGoHome, replace, replaceAll, setPendingRoute, setAnimation])
 
   const checkLoggedIn = async (): Promise<void> => {
     if (!user) {
@@ -293,7 +284,6 @@ export default function InitScreen() {
 
   // Effects
   useEffect(() => {
-
     console.log("INDEX: USE EFFECT: authLoading, isNavigationReady:", authLoading, isNavigationReady)
     if (authLoading || !isNavigationReady) return
     if (initStartedRef.current) return

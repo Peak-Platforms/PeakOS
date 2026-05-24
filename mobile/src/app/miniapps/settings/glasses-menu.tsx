@@ -12,13 +12,7 @@ import {useAppTheme} from "@/contexts/ThemeContext"
 import {translate} from "@/i18n/translate"
 import {sortAppsByLastOpenTime, SYSTEM_APPS, useApplets, type ClientAppletInterface} from "@/stores/applets"
 import {SETTINGS, useSetting} from "@/stores/settings"
-import {
-  buildMenuItems,
-  filterCompatibleMenuItems,
-  getDefaultMenuApps,
-  syncDashboardMenu,
-  type GlassesMenuItem,
-} from "@/utils/glassesMenu"
+import {buildMenuItems, filterCompatibleMenuItems, getDefaultMenuApps, type GlassesMenuItem} from "@/utils/glassesMenu"
 
 const MAX_MENU_ITEMS = 10
 
@@ -26,7 +20,7 @@ export default function GlassesMenuScreen() {
   const {theme} = useAppTheme()
   const {goBack} = useNavigationHistory()
   const applets = useApplets()
-  const [savedMenuApps, setSavedMenuApps] = useSetting<GlassesMenuItem[] | null>(SETTINGS.glasses_menu_apps.key)
+  const [savedMenuApps, setSavedMenuApps] = useSetting<GlassesMenuItem[] | null>(SETTINGS.menu_apps.key)
   const [menuItems, setMenuItems] = useState<GlassesMenuItem[]>([])
   const [showPicker, setShowPicker] = useState(false)
   const [sortedAvailable, setSortedAvailable] = useState<ClientAppletInterface[]>([])
@@ -50,17 +44,15 @@ export default function GlassesMenuScreen() {
     async (items: GlassesMenuItem[]) => {
       setMenuItems(items)
       await setSavedMenuApps(items)
-      await syncDashboardMenu()
     },
     [setSavedMenuApps],
   )
 
   const removeItem = useCallback(
     (packageName: string) => {
-      setMenuItems(current => {
-        const updated = current.filter(item => item.packageName !== packageName)
+      setMenuItems((current) => {
+        const updated = current.filter((item) => item.packageName !== packageName)
         setSavedMenuApps(updated)
-        syncDashboardMenu()
         return updated
       })
     },
@@ -212,7 +204,6 @@ export default function GlassesMenuScreen() {
           const defaults = await getDefaultMenuApps(applets)
           setMenuItems(defaults)
           await setSavedMenuApps(null)
-          await syncDashboardMenu()
         }}
       />
     </View>
@@ -239,7 +230,6 @@ export default function GlassesMenuScreen() {
           onDragEnd={({data}) => {
             setMenuItems(data)
             setSavedMenuApps(data)
-            syncDashboardMenu()
           }}
           ListHeaderComponent={listHeader}
           ListFooterComponent={listFooter}

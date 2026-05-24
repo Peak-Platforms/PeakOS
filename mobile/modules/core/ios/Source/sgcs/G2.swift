@@ -1044,18 +1044,8 @@ class G2: NSObject, SGCManager {
     var type = DeviceTypes.G2
     let hasMic = true
 
-    // Connection state
+    /// Connection state
     private var connectionState: String = ConnTypes.DISCONNECTED
-    private var _ready: Bool = false
-    private var ready: Bool {
-        get { _ready }
-        set {
-            _ready = newValue
-            if !newValue {
-                GlassesStore.shared.apply("glasses", "batteryLevel", -1)
-            }
-        }
-    }
 
     // BLE peripherals (L+R)
     private var centralManager: CBCentralManager?
@@ -1069,42 +1059,47 @@ class G2: NSObject, SGCManager {
     private var leftAudioChar: CBCharacteristic?
     private var leftInitialized: Bool = false
     private var rightInitialized: Bool = false
+    private var leftAuthenticated: Bool = false
+    private var rightAuthenticated: Bool = false
     private var isDisconnecting = false
+    private var pairingTimeoutTimer: DispatchWorkItem?
 
     /// Device search
     var DEVICE_SEARCH_ID = "NOT_SET"
     /// map device names to serial numbers:
     private var deviceNameToSerialNumber: [String: String] = [:]
 
-    /// Stored UUIDs for background reconnection
-    private var leftGlassUUID: UUID? {
-        get {
-            UserDefaults.standard.string(forKey: "g2_leftGlassUUID").flatMap {
-                UUID(uuidString: $0)
-            }
-        }
-        set {
-            if let v = newValue {
-                UserDefaults.standard.set(v.uuidString, forKey: "g2_leftGlassUUID")
-            } else {
-                UserDefaults.standard.removeObject(forKey: "g2_leftGlassUUID")
-            }
-        }
+    /// Stored UUIDs per serial number for background reconnection.
+    /// Maps serial number -> peripheral UUID string. Persisted across forget() so previously
+    /// paired devices can reconnect quickly without a fresh scan.
+    private var leftGlassUUIDMap: [String: String] {
+        get { UserDefaults.standard.dictionary(forKey: "g2_leftGlassUUIDMap") as? [String: String] ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: "g2_leftGlassUUIDMap") }
     }
 
-    private var rightGlassUUID: UUID? {
-        get {
-            UserDefaults.standard.string(forKey: "g2_rightGlassUUID").flatMap {
-                UUID(uuidString: $0)
-            }
-        }
-        set {
-            if let v = newValue {
-                UserDefaults.standard.set(v.uuidString, forKey: "g2_rightGlassUUID")
-            } else {
-                UserDefaults.standard.removeObject(forKey: "g2_rightGlassUUID")
-            }
-        }
+    private var rightGlassUUIDMap: [String: String] {
+        get { UserDefaults.standard.dictionary(forKey: "g2_rightGlassUUIDMap") as? [String: String] ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: "g2_rightGlassUUIDMap") }
+    }
+
+    private func leftGlassUUID(forSN sn: String) -> UUID? {
+        return leftGlassUUIDMap[sn].flatMap { UUID(uuidString: $0) }
+    }
+
+    private func rightGlassUUID(forSN sn: String) -> UUID? {
+        return rightGlassUUIDMap[sn].flatMap { UUID(uuidString: $0) }
+    }
+
+    private func setLeftGlassUUID(_ uuid: UUID, forSN sn: String) {
+        var m = leftGlassUUIDMap
+        m[sn] = uuid.uuidString
+        leftGlassUUIDMap = m
+    }
+
+    private func setRightGlassUUID(_ uuid: UUID, forSN sn: String) {
+        var m = rightGlassUUIDMap
+        m[sn] = uuid.uuidString
+        rightGlassUUIDMap = m
     }
 
     /// Reconnection
@@ -1123,6 +1118,12 @@ class G2: NSObject, SGCManager {
     private var imageSessionCounter: Int = 0
     private var heartbeatTask: Task<Void, Never>?
     private var heartbeatCounter: Int = 0
+    private var evenHubQueueTask: Task<Void, Never>?
+    private var pendingTextMsg: Data?
+    private var lastEvenHubMsg: Data?
+    private var lastEvenHubResendsRemaining: Int = 0
+    private let EVEN_HUB_RESEND_COUNT: Int = 1
+    private let evenHubQueueLock = NSLock()
     private var authStarted: Bool = false
 
     /// Dashboard menu: appId → packageName mapping for selection reverse lookup
@@ -1248,6 +1249,19 @@ class G2: NSObject, SGCManager {
     }
 
     // MARK: - Authentication Sequence
+
+    private func authLeft() {
+        // Auth to left side
+        if leftPeripheral != nil && leftWriteChar != nil {
+            let authL = DevSettingsProto.authCmd(magicRandom: sendManager.nextMagicRandom())
+            sendDevSettingsCommand(authL, left: true, right: false)
+        }
+    }
+
+    private func authRight() {
+        let authR = DevSettingsProto.authCmd(magicRandom: sendManager.nextMagicRandom())
+        sendDevSettingsCommand(authR, left: false, right: true)
+    }
 
     private func runAuthSequence() {
         Bridge.log("G2: Running auth sequence")
@@ -1420,52 +1434,36 @@ class G2: NSObject, SGCManager {
                     // Start heartbeats after auth
                     self.startHeartbeats()
 
-                    // Mark as ready and request device info (version + battery)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                        guard let self = self else { return }
-                        self.ready = true
-                        Task { await self.reconnectionManager.stop() }
-                        Bridge.log("G2: Auth sequence complete, glasses ready")
+                    Task { await self.reconnectionManager.stop() }
+                    Bridge.log("G2: Auth sequence complete, glasses ready")
 
-                        // Set device_name so CoreManager can save it for reconnection
-                        if let peripheralName = self.rightPeripheral?.name
-                            ?? self.leftPeripheral?.name,
-                            let idNumber = self.extractIdNumber(peripheralName)
-                        {
-                            let deviceId = "\(idNumber)"
-                            GlassesStore.shared.apply("core", "device_name", deviceId)
-                            Bridge.log("G2: Set device_name to \(deviceId)")
-                        }
-
-                        // Set bluetooth name and device model for Device Info page
-                        let btName =
-                            self.rightPeripheral?.name
-                                ?? self.leftPeripheral?.name ?? ""
-                        GlassesStore.shared.apply("glasses", "bluetoothName", btName)
-                        GlassesStore.shared.apply("glasses", "deviceModel", DeviceTypes.G2)
-
-                        GlassesStore.shared.apply("glasses", "connected", true)
-                        GlassesStore.shared.apply("glasses", "fullyBooted", true)
-
-                        // connnect a controller if we have one:
-                        self.connectController()
-
-                        // Query version + battery info from glasses
-                        self.requestDeviceInfo()
-
-                        // Re-send dashboard menu if we have stored items
-                        if !self.dashboardMenuItems.isEmpty {
-                            let (msg, appIdMap) = MenuProto.sendMenuInfo(
-                                magicRandom: self.sendManager.nextMagicRandom(),
-                                items: self.dashboardMenuItems
-                            )
-                            self.menuAppIdToPackageName = appIdMap
-                            self.sendMenuCommand(msg)
-                            Bridge.log(
-                                "G2: Re-sent dashboard menu (\(self.dashboardMenuItems.count) items)"
-                            )
-                        }
+                    // Set device_name so CoreManager can save it for reconnection
+                    if let peripheralName = self.rightPeripheral?.name
+                        ?? self.leftPeripheral?.name,
+                        let serialNumber = self.deviceNameToSerialNumber[peripheralName]
+                    {
+                        GlassesStore.shared.apply("core", "device_name", serialNumber)
+                        Bridge.log("G2: Set device_name to \(serialNumber)")
                     }
+
+                    // Set bluetooth name and device model for Device Info page
+                    let btName =
+                        self.rightPeripheral?.name
+                            ?? self.leftPeripheral?.name ?? ""
+                    GlassesStore.shared.apply("glasses", "bluetoothName", btName)
+                    GlassesStore.shared.apply("glasses", "deviceModel", DeviceTypes.G2)
+
+                    GlassesStore.shared.apply("glasses", "connected", true)
+                    GlassesStore.shared.apply("glasses", "fullyBooted", true)
+
+                    // connnect a controller if we have one:
+                    self.connectController()
+
+                    // Query version + battery info from glasses
+                    self.requestDeviceInfo()
+
+                    // send dashboard menu if we have stored items
+                    self.sendMenuApps()
                 }
             }
         }
@@ -1531,15 +1529,36 @@ class G2: NSObject, SGCManager {
                 }
             }
         }
+
+        // EvenHub text command queue: drain the most recent pending updateText every 100ms
+        evenHubQueueTask?.cancel()
+        evenHubQueueTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                guard !Task.isCancelled else { break }
+                await MainActor.run {
+                    self?.drainEvenHubQueue()
+                }
+            }
+        }
     }
 
     private func stopHeartbeats() {
         heartbeatTask?.cancel()
         heartbeatTask = nil
+        evenHubQueueTask?.cancel()
+        evenHubQueueTask = nil
+        evenHubQueueLock.lock()
+        pendingTextMsg = nil
+        lastEvenHubMsg = nil
+        lastEvenHubResendsRemaining = 0
+        evenHubQueueLock.unlock()
     }
 
     private func sendEvenHubHeartbeat() {
-        guard ready else { return }
+        let isFullyBooted = GlassesStore.shared.get("glasses", "fullyBooted") as? Bool ?? false
+        guard isFullyBooted else { return }
+
         let msg = EvenHubProto.heartbeatMessage()
         // Write to BOTH arms. If either side sees no traffic for ~50s while
         // backgrounded, iOS bluetoothd reclaims the connection as "Unused"
@@ -1554,7 +1573,8 @@ class G2: NSObject, SGCManager {
     }
 
     private func sendDevSettingsHeartbeat() {
-        guard ready else { return }
+        let isFullyBooted = GlassesStore.shared.get("glasses", "fullyBooted") as? Bool ?? false
+        guard isFullyBooted else { return }
         let msg = DevSettingsProto.baseHeartbeat(magicRandom: sendManager.nextMagicRandom())
         sendDevSettingsCommand(msg, left: true, right: true)
     }
@@ -1564,6 +1584,14 @@ class G2: NSObject, SGCManager {
         let msg = G2SettingProto.requestInfo(magicRandom: sendManager.nextMagicRandom())
         sendG2SettingCommand(msg)
         // Bridge.log("G2: Requested device info (battery/version)")
+    }
+
+    private func sendMenuApps() {
+        let menuItems = GlassesStore.shared.get("core", "menu_apps") as? [[String: Any]] ?? []
+        if menuItems.isEmpty {
+            return
+        }
+        setDashboardMenu(menuItems)
     }
 
     // MARK: - SGCManager: Display Control
@@ -2244,17 +2272,56 @@ class G2: NSObject, SGCManager {
             contentLength: Int32(text.utf8.count),
             content: text
         )
-        sendEvenHubCommand(msg)
+        queueEvenHubCommand(msg)
         currentTextContent = text
         currentBitmapBase64 = ""
+    }
+
+    private func queueEvenHubCommand(_ payload: Data) {
+        evenHubQueueLock.lock()
+        pendingTextMsg = payload
+        evenHubQueueLock.unlock()
+    }
+
+    private func drainEvenHubQueue() {
+        evenHubQueueLock.lock()
+        let msg = pendingTextMsg
+        pendingTextMsg = nil
+        let toSend: Data?
+        if let msg = msg {
+            lastEvenHubMsg = msg
+            lastEvenHubResendsRemaining = EVEN_HUB_RESEND_COUNT
+            toSend = msg
+        } else if lastEvenHubResendsRemaining > 0, let last = lastEvenHubMsg {
+            lastEvenHubResendsRemaining -= 1
+            toSend = last
+        } else {
+            toSend = nil
+        }
+        evenHubQueueLock.unlock()
+        guard let toSend = toSend else { return }
+        sendEvenHubCommand(toSend)
     }
 
     // MARK: - SGCManager: Audio Control
 
     func setMicEnabled(_ enabled: Bool) {
         Bridge.log("G2: setMicEnabled(\(enabled))")
-        GlassesStore.shared.apply("glasses", "micEnabled", enabled)
+        let currentEnabled = GlassesStore.shared.get("glasses", "micEnabled") as? Bool ?? false
+        if currentEnabled && enabled {
+            // if already enabled, set to disabled, then send enabled after 500ms:
+            GlassesStore.shared.apply("glasses", "micEnabled", true)
+            let msg = EvenHubProto.audioControlMessage(enable: false)
+            sendEvenHubCommand(msg)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self = self else { return }
+                let msg = EvenHubProto.audioControlMessage(enable: true)
+                self.sendEvenHubCommand(msg)
+            }
+            return
+        }
 
+        GlassesStore.shared.apply("glasses", "micEnabled", enabled)
         let msg = EvenHubProto.audioControlMessage(enable: enabled)
         sendEvenHubCommand(msg)
     }
@@ -2275,11 +2342,31 @@ class G2: NSObject, SGCManager {
         Bridge.log("G2: connectById(\(id))")
         DEVICE_SEARCH_ID = id
         startScan()
+        startPairingTimeout()
+    }
+
+    private func startPairingTimeout() {
+        pairingTimeoutTimer?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            if self.leftPeripheral != nil && self.rightPeripheral == nil {
+                Bridge.log("G2: pairing timeout — found LEFT but not RIGHT")
+                Bridge.sendPairFailureEvent("errors:pairNeedDisconnect")
+            }
+        }
+        pairingTimeoutTimer = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
+    }
+
+    private func cancelPairingTimeout() {
+        pairingTimeoutTimer?.cancel()
+        pairingTimeoutTimer = nil
     }
 
     func disconnect() {
         Bridge.log("G2: disconnect()")
         isDisconnecting = true
+        cancelPairingTimeout()
         stopHeartbeats()
         Task { await reconnectionManager.stop() }
 
@@ -2297,10 +2384,11 @@ class G2: NSObject, SGCManager {
             centralManager?.cancelPeripheralConnection(peripheral)
         }
 
-        ready = false
         leftInitialized = false
         rightInitialized = false
         authStarted = false
+        leftAuthenticated = false
+        rightAuthenticated = false
         startupPageCreated = false
         pageCreated = false
         pageHasTextContainer = false
@@ -2313,8 +2401,8 @@ class G2: NSObject, SGCManager {
         stopHeartbeats()
         Task { await reconnectionManager.stop() }
         disconnect()
-        leftGlassUUID = nil
-        rightGlassUUID = nil
+        // Note: leftGlassUUIDMap / rightGlassUUIDMap intentionally preserved so a future
+        // pair to the same serial number can reuse the cached peripheral UUID.
         leftPeripheral = nil
         rightPeripheral = nil
         leftWriteChar = nil
@@ -2340,8 +2428,9 @@ class G2: NSObject, SGCManager {
     }
 
     func connectController() {
-        guard ready else {
-            Bridge.log("G2: connectController - not ready, ignoring")
+        let isFullyBooted = GlassesStore.shared.get("glasses", "fullyBooted") as? Bool ?? false
+        guard isFullyBooted else {
+            Bridge.log("G2: connectController - g2 not fully booted, ignoring")
             return
         }
 
@@ -2368,8 +2457,9 @@ class G2: NSObject, SGCManager {
     }
 
     func disconnectController() {
-        guard ready else {
-            Bridge.log("G2: disconnectController - not ready, ignoring")
+        let isFullyBooted = GlassesStore.shared.get("glasses", "fullyBooted") as? Bool ?? false
+        guard isFullyBooted else {
+            Bridge.log("G2: disconnectController - g2 not fully booted, ignoring")
             return
         }
 
@@ -2393,7 +2483,7 @@ class G2: NSObject, SGCManager {
         )
         sendDevSettingsCommand(msg)
 
-        GlassesStore.shared.apply("glasses", "controllerMacAddress", "")
+        // GlassesStore.shared.apply("glasses", "controllerMacAddress", "")
         GlassesStore.shared.apply("glasses", "controllerConnected", false)
         GlassesStore.shared.apply("glasses", "controllerFullyBooted", false)
         Bridge.log("G2: Sent RING_DISCONNECT_INFO for MAC \(mac)")
@@ -2532,9 +2622,6 @@ class G2: NSObject, SGCManager {
     func startStream(_: [String: Any]) {}
     func stopStream() {}
     func sendStreamKeepAlive(_: [String: Any]) {}
-    func startBufferRecording() {}
-    func stopBufferRecording() {}
-    func saveBufferVideo(requestId _: String, durationSeconds _: Int) {}
     func stopVideoRecording(requestId _: String) {}
     func sendButtonPhotoSettings() {}
     func sendButtonModeSetting() {}
@@ -2647,7 +2734,9 @@ class G2: NSObject, SGCManager {
             return false
         }
 
-        guard let leftUUID = leftGlassUUID, let rightUUID = rightGlassUUID else { return false }
+        guard let leftUUID = leftGlassUUID(forSN: DEVICE_SEARCH_ID),
+              let rightUUID = rightGlassUUID(forSN: DEVICE_SEARCH_ID)
+        else { return false }
 
         let knownLeft = centralManager?.retrievePeripherals(withIdentifiers: [leftUUID])
         let knownRight = centralManager?.retrievePeripherals(withIdentifiers: [rightUUID])
@@ -2739,7 +2828,7 @@ class G2: NSObject, SGCManager {
         case ServiceID.evenHub.rawValue:
             handleEvenHubResponse(result.payload)
         case ServiceID.deviceSettings.rawValue:
-            handleDevSettingsResponse(result.payload)
+            handleDevSettingsResponse(result.payload, sourceKey: sourceKey)
         case ServiceID.g2Setting.rawValue:
             handleG2SettingResponse(result.payload)
         case ServiceID.menu.rawValue:
@@ -2800,9 +2889,9 @@ class G2: NSObject, SGCManager {
                         Bridge.log("G2: Menu miniapp selected — \(packageName)")
                         Bridge.sendMiniappSelected(packageName: packageName)
                         // clear the display after a delay:
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                            self.clearDisplay()
-                        }
+                        // DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        //     self.clearDisplay()
+                        // }
                     } else {
                         Bridge.log(
                             "G2: Menu selection ignored — placeholder or unknown appId=\(appId)"
@@ -2925,7 +3014,7 @@ class G2: NSObject, SGCManager {
             )
             Bridge.log("G2: SysEvent → \(eventType) \(eventSource)")
 
-            if eventSource == 1 {
+            if eventSource == 2 {
                 // controller must be connected and fully booted:
                 setControllerFullyConnected()
             }
@@ -2968,6 +3057,9 @@ class G2: NSObject, SGCManager {
                 pageHasTextContainer = false
                 currentTextContent = ""
                 currentBitmapBase64 = ""
+                // Firmware kills the mic on system exit; re-arm it if it should be on
+                GlassesStore.shared.apply("glasses", "micEnabled", false)
+                CoreManager.shared.updateMicState()
                 // Force re-create the page to reclaim EvenHub focus
                 // Task {
                 //     try? await Task.sleep(nanoseconds: 1_000_000_000)  // 1000ms for glasses to finish transition
@@ -3040,7 +3132,7 @@ class G2: NSObject, SGCManager {
         connectController()
     }
 
-    private func handleDevSettingsResponse(_ data: Data) {
+    private func handleDevSettingsResponse(_ data: Data, sourceKey: String) {
         // DevSettings responses (auth acks, heartbeat acks) — mostly informational
 
         var reader = ProtobufReader(data)
@@ -3111,7 +3203,6 @@ class G2: NSObject, SGCManager {
 
                 if connStatus == 22 {
                     Bridge.log("G2: Ring disconnected")
-                    // GlassesStore.shared.apply("glasses", "controllerConnected", false)
                     GlassesStore.shared.apply("glasses", "controllerFullyBooted", false)
                     GlassesStore.shared.apply("glasses", "controllerSearching", true)
                     reconnectController()
@@ -3120,11 +3211,37 @@ class G2: NSObject, SGCManager {
                 if connStatus == 8 {
                     Bridge.log("G2: Ring maybe disconnected?")
                     // GlassesStore.shared.apply("glasses", "controllerConnected", false)
-                    GlassesStore.shared.apply("glasses", "controllerFullyBooted", false)
-                    GlassesStore.shared.apply("glasses", "controllerSearching", true)
-                    reconnectController()
+                    // GlassesStore.shared.apply("glasses", "controllerFullyBooted", false)
+                    // GlassesStore.shared.apply("glasses", "controllerSearching", true)
+                    // reconnectController()
                 }
                 // // GlassesStore.shared.apply("glasses", "ringConnectedToGlasses", connected)
+            }
+        }
+
+        if cmdValue == DevCfgCommandId.authentication.rawValue {
+            // DevCfgDataPackage: field 2 = magicRandom, field 3 = AuthMgr { field 1 = secAuth }
+            let magicRandom = fields[2] as? Int32 ?? -1
+            var secAuth: Bool? = nil
+            if let authData = fields[3] as? Data {
+                var authReader = ProtobufReader(authData)
+                let authFields = authReader.parseFields()
+                if let v = authFields[1] as? Int32 {
+                    secAuth = (v != 0)
+                }
+            }
+            let secAuthStr = secAuth.map { $0 ? "true" : "false" } ?? "?"
+            Bridge.log("G2: Authentication response: \(sourceKey) secAuth=\(secAuthStr)")
+            if secAuth == true {
+                if sourceKey == "L" {
+                    leftAuthenticated = true
+                } else if sourceKey == "R" {
+                    rightAuthenticated = true
+                }
+                if leftAuthenticated && rightAuthenticated {
+                    Bridge.log("G2: Both sides authenticated, setting fully booted and connected")
+                    setFullyConnected()
+                }
             }
         }
     }
@@ -3288,6 +3405,8 @@ class G2: NSObject, SGCManager {
         }
     }
 
+    private var lastAudioFrame: Data?
+
     private func handleAudioData(_ data: Data) {
         // G2 audio arrives on AUDIO_NOTIFY characteristic
         // Format: ~200+ byte chunks, use first 200 bytes, split into 40-byte LC3 frames
@@ -3296,11 +3415,16 @@ class G2: NSObject, SGCManager {
         let usableLength = min(data.count, 200)
         guard usableLength >= 40 else { return }
 
-        let audioData = data.prefix(usableLength)
+        let audioData = Data(data.prefix(usableLength))
+        if lastAudioFrame == audioData {
+            // Bridge.log("G2: audio dup")
+            return
+        }
+        lastAudioFrame = audioData
 
         // Forward LC3 data to CoreManager for decoding
         // G2 uses 40-byte frames (vs G1's 20-byte frames)
-        CoreManager.shared.handleGlassesMicData(Data(audioData), 40)
+        CoreManager.shared.handleGlassesMicData(audioData, 40)
     }
 }
 
@@ -3318,6 +3442,15 @@ func extractSN(from data: Data) -> String? {
         .replacingOccurrences(
             of: "[\\x00-\\x1F\\x7F]", with: "", options: .regularExpression
         )
+}
+
+/// Extract the BLE MAC from G2 manufacturer data.
+/// Layout: "ER"(2) + SN(14) + MAC(6, little-endian) + flag(1)
+/// Returns "AA:BB:CC:DD:EE:FF" (big-endian, colon-separated).
+func extractMac(from data: Data) -> String? {
+    guard data.count >= 22 else { return nil }
+    let macLE = data[16 ..< 22]
+    return macLE.reversed().map { String(format: "%02X", $0) }.joined(separator: ":")
 }
 
 extension G2: CBCentralManagerDelegate {
@@ -3357,8 +3490,19 @@ extension G2: CBCentralManagerDelegate {
                 return
             }
             // sn = "S200LACA040040"
-            Bridge.log("G2: Discovered: \(name) (SN: \(serialNumber))")
+            let mfgHex = mfgData.map { String(format: "%02X", $0) }.joined(separator: " ")
+            Bridge.log("G2: Discovered: \(name) (SN: \(serialNumber)) mfgData[\(mfgData.count)]: \(mfgHex)")
             self.deviceNameToSerialNumber[name] = serialNumber
+
+            // Save MAC per side; ring's advStart needs the left lens MAC.
+            if let mac = extractMac(from: mfgData) {
+                if name.contains("_L_") {
+                    GlassesStore.shared.apply("glasses", "leftMacAddress", mac)
+                    GlassesStore.shared.apply("glasses", "btMacAddress", mac)
+                } else if name.contains("_R_") {
+                    GlassesStore.shared.apply("glasses", "rightMacAddress", mac)
+                }
+            }
             // GlassesStore.shared.apply("glasses", "signalStrength", RSSI.intValue)
 
             // Always emit discovered device to frontend
@@ -3391,6 +3535,7 @@ extension G2: CBCentralManagerDelegate {
             // Stop scanning once we have both
             if self.leftPeripheral != nil && self.rightPeripheral != nil {
                 self.stopScan()
+                self.cancelPairingTimeout()
             }
         }
     }
@@ -3400,11 +3545,16 @@ extension G2: CBCentralManagerDelegate {
             guard let self = self else { return }
             Bridge.log("G2: Connected to \(peripheral.name ?? "unknown")")
 
-            // Store UUID for reconnection
-            if peripheral === self.leftPeripheral {
-                self.leftGlassUUID = peripheral.identifier
-            } else if peripheral === self.rightPeripheral {
-                self.rightGlassUUID = peripheral.identifier
+            // Store UUID for reconnection, keyed by serial number.
+            let sn = peripheral.name.flatMap { self.deviceNameToSerialNumber[$0] }
+            if let sn = sn {
+                if peripheral === self.leftPeripheral {
+                    self.setLeftGlassUUID(peripheral.identifier, forSN: sn)
+                } else if peripheral === self.rightPeripheral {
+                    self.setRightGlassUUID(peripheral.identifier, forSN: sn)
+                }
+            } else {
+                Bridge.log("G2: didConnect — no SN for \(peripheral.name ?? "unknown"), skipping UUID save")
             }
 
             // Discover services - scan for all since we need to find the EvenHub characteristics
@@ -3436,7 +3586,6 @@ extension G2: CBCentralManagerDelegate {
             self.rightAudioChar = nil
             self.authStarted = false
 
-            self.ready = false
             self.startupPageCreated = false
             self.pageCreated = false
             self.pageHasTextContainer = false
@@ -3454,7 +3603,7 @@ extension G2: CBCentralManagerDelegate {
                 guard let self else { return false }
 
                 // Check if already connected
-                if await MainActor.run(body: { self.ready }) {
+                if await MainActor.run(body: { GlassesStore.shared.get("glasses", "fullyBooted") as? Bool ?? false }) {
                     Bridge.log("G2: Already connected, stopping reconnection")
                     return true
                 }

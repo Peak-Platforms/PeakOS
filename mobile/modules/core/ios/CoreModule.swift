@@ -87,6 +87,7 @@ public class CoreModule: Module {
         AsyncFunction("update") { (category: String, values: [String: Any]) in
             await MainActor.run {
                 for (key, value) in values {
+                    if value is NSNull { continue }
                     GlassesStore.shared.apply(category, key, value)
                 }
             }
@@ -273,24 +274,6 @@ public class CoreModule: Module {
         }
 
         // MARK: - Video Recording Commands
-
-        AsyncFunction("startBufferRecording") {
-            await MainActor.run {
-                CoreManager.shared.startBufferRecording()
-            }
-        }
-
-        AsyncFunction("stopBufferRecording") {
-            await MainActor.run {
-                CoreManager.shared.stopBufferRecording()
-            }
-        }
-
-        AsyncFunction("saveBufferVideo") { (requestId: String, durationSeconds: Int) in
-            await MainActor.run {
-                CoreManager.shared.saveBufferVideo(requestId, durationSeconds)
-            }
-        }
 
         AsyncFunction("startVideoRecording") { (requestId: String, save: Bool, flash: Bool, sound: Bool) in
             await MainActor.run {
